@@ -1,0 +1,95 @@
+name: Uppdatera från Accounted och migrera databasen
+
+# Ambi Studios egen workflow. Varje måndag, eller när den startas för hand:
+#   1. slår ihop Accounteds senaste main (erp-mafia/accounted) med vår main
+#      som en vanlig merge-commit, utan rebase,
+#   2. kör bootstrap.sql och alla nya migreringar mot vår Supabase-databas,
+#   3. pushar till main, så att Vercel driftsätter den nya versionen.
+# Migreringarna körs före pushen, så appen startar aldrig mot en gammal databas.
+# Misslyckas ett steg pushas inget och GitHub mejlar.
+#
+# Accounteds egna workflows (CI, publicering m.m.) tas inte in i forken: vi
+# behåller bara den här filen, så att en merge aldrig ändrar .github/workflows
+# och GITHUB_TOKEN räcker för att pusha.
+#
+# Hemlighet: SUPABASE_DB_URL (session pooler-adressen med lösenord) i miljön
+# `production`, som bara main får använda.
+
+on:
+  schedule:
+    - cron: '0 3 * * 1' # måndagar 03:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: production-database
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Uppdatera och migrera
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: production
+    env:
+      SUPABASE_CLI: supabase@2.119.0
+      UPSTREAM: https://github.com/erp-mafia/accounted.git
+    steps:
+      - name: Kontrollera hemligheten
+        env:
+          HAS_DB_URL: ${{ secrets.SUPABASE_DB_URL != '' }}
+        run: |
+          test "$HAS_DB_URL" = "true" || { echo "::error::SUPABASE_DB_URL saknas i miljön production"; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 20
+          package-manager-cache: false
+
+      - name: Slå ihop Accounteds main
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM"
+          git fetch --quiet upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Inget nytt från Accounted."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git merge --no-ff --no-commit upstream/main || true
+          # Behåll våra egna workflows och släpp Accounteds.
+          git rm -r -q --cached --ignore-unmatch .github/workflows
+          git checkout HEAD -- .github/workflows
+          git clean -fdq -- .github/workflows
+          conflicts="$(git diff --name-only --diff-filter=U)"
+          if [ -n "$conflicts" ]; then
+            echo "::error::Konflikt med Accounteds ändringar i: $conflicts"
+            git merge --abort
+            exit 1
+          fi
+          git commit --quiet -m "Slå ihop Accounted $(git rev-parse --short upstream/main)"
+          git log --oneline -1
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Kör startskript och migreringar
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -q -f supabase/bootstrap.sql
+          npx -y "$SUPABASE_CLI" migration list --db-url "$SUPABASE_DB_URL" | tail -8
+          npx -y "$SUPABASE_CLI" db push --include-all --yes --db-url "$SUPABASE_DB_URL"
+          npx -y "$SUPABASE_CLI" migration list --db-url "$SUPABASE_DB_URL" | tail -8
+
+      - name: Pusha till main
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin HEAD:main
