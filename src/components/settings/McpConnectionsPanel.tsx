@@ -10,6 +10,7 @@ import {
   SpinnerIcon,
 } from '@/components/icons'
 import { Button } from '@/components/ui/button'
+import { LoadError } from '@/components/ui/empty-state'
 import { useViewerLock } from '@/components/ui/viewer-lock'
 import { Badge } from '@/components/ui/badge'
 import { AttnLine } from '@/components/ui/attn-line'
@@ -83,6 +84,8 @@ const ICON = {
   local: CommandLineIcon,
   cursor: CursorMark,
   gemini: GeminiMark,
+  // No vendor mark for Copilot Studio: the generic MCP mark.
+  copilot: McpMark,
   mcp: McpMark,
   other: McpMark,
   key: KeyIcon,
@@ -189,6 +192,8 @@ export function McpConnectionsPanel({
   keys,
   companies = [],
   isLoading,
+  loadFailed = false,
+  onRetry,
   onRevoke,
   onKeysChanged,
 }: {
@@ -196,6 +201,9 @@ export function McpConnectionsPanel({
   /** The caller's companies (useApiKeys): with two or more, each row shows and edits its company reach. */
   companies?: PickerCompany[]
   isLoading: boolean
+  /** The keys could not be read: what is connected is unknown. */
+  loadFailed?: boolean
+  onRetry?: () => void
   onRevoke: (id: string, toastTitle: string) => Promise<void>
   /** Re-read the keys after a row's companies were edited. */
   onKeysChanged?: () => void
@@ -246,7 +254,8 @@ export function McpConnectionsPanel({
   function rowName(key: ApiKeyRow): string {
     const kind = connectionKind(key)
     if (kind === 'key') return key.name
-    if (kind === 'claude' || kind === 'chatgpt' || kind === 'grok' || kind === 'gemini') return targetName(kind)
+    if (kind === 'claude' || kind === 'chatgpt' || kind === 'grok' || kind === 'gemini' || kind === 'copilot') return targetName(kind)
+    if (kind === 'partner') return key.client_label ?? t('kind_partner')
     return t(`kind_${kind}`)
   }
 
@@ -296,6 +305,16 @@ export function McpConnectionsPanel({
       <div className="flex items-center justify-center py-12">
         <SpinnerIcon className="h-5 w-5 animate-spin text-muted-foreground" />
       </div>
+    )
+  }
+
+  // Unknown is not "nothing connected": the hero and the tiles would invite a
+  // user who is already connected to add a second connection.
+  if (loadFailed) {
+    return (
+      <SettingsGroup>
+        <LoadError title={t('connections_load_failed')} onRetry={() => onRetry?.()} />
+      </SettingsGroup>
     )
   }
 

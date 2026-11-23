@@ -65,7 +65,7 @@ import { balancingProposalSide } from '@/lib/bookkeeping/kontering-amount-entry'
 import { buildVoucherSeriesOptions, formatVoucher, resolveDefaultSeriesForSource } from '@/lib/bookkeeping/voucher-series-resolver'
 import { bookedEntryOf, type BookedEntry } from '@/lib/bookkeeping/booking-answer'
 import { resolveFxLineSlot } from '@/lib/bookkeeping/fx-line-slot'
-import { resolveVoucherEnter, type VoucherEnterAction } from '@/lib/bookkeeping/voucher-enter-key'
+import { isBlankVoucherRow, resolveVoucherEnter, type VoucherEnterAction } from '@/lib/bookkeeping/voucher-enter-key'
 import { fiscalYearShortName } from '@/lib/bookkeeping/suggest-fiscal-period'
 import {
   foldGeneratedVatLines,
@@ -121,6 +121,11 @@ interface Props {
   /** Render without the Card chrome (e.g. inside a dialog) but keep the full
    *  non-embedded field set (series, notes, documents, voucher hint). */
   bare?: boolean
+  /** The form sits on a page (the booking screen), not in a dialog: the
+   *  verifikat header has no raised box of its own (Stil v3: no cards inside
+   *  the panel), only a hairline under it, so its fields share the rows' left
+   *  edge. */
+  onPage?: boolean
   /** Edit an existing DRAFT in place: the form PATCHes this entry instead of
    *  creating a new one. Only the draft's header + lines are updated. */
   editEntryId?: string
@@ -155,9 +160,24 @@ interface Props {
   /** Fired on mount and whenever the form gains or loses unsaved input, so a
    *  host dialog can let Escape close it only while nothing would be lost. */
   onHasContentChange?: (hasContent: boolean) => void
+  /** Fired on mount and whenever the attached files change (a drop, a
+   *  finished upload, a removal, the reset after a save), so a host dialog
+   *  can show the underlag beside the rows. The form keeps the list. */
+  onUploadedFilesChange?: (files: UploadedFile[]) => void
+  /** A wider surface that also takes a dropped file for the form's own
+   *  upload zone (the booking screen: a drop anywhere on the page). */
+  uploadDropSurfaceRef?: React.RefObject<HTMLElement | null>
 }
 
 const BLANK_LINE: FormLine = { account_number: '', debit_amount: '', credit_amount: '', line_description: '' }
+
+/** The header's columns: date (when shown), description, series (when shown). Literal classes for Tailwind. */
+function headerColumns(date: boolean, series: boolean): string {
+  if (date && series) return 'sm:grid-cols-[9.5rem_minmax(0,1fr)_14rem]'
+  if (date) return 'sm:grid-cols-[9.5rem_minmax(0,1fr)]'
+  if (series) return 'sm:grid-cols-[minmax(0,1fr)_14rem]'
+  return ''
+}
 
 export default function JournalEntryForm({
   onCreated,
@@ -172,6 +192,7 @@ export default function JournalEntryForm({
   submitUrl,
   embedded,
   bare,
+  onPage = false,
   editEntryId,
   initialCurrency,
   initialExchangeRate,
@@ -183,6 +204,8 @@ export default function JournalEntryForm({
   cashAccountId,
   onDuplicateMatched,
   onHasContentChange,
+  onUploadedFilesChange,
+  uploadDropSurfaceRef,
 }: Props) {
   const { canWrite } = useCanWrite()
   const { toast } = useToast()
@@ -325,6 +348,8 @@ export default function JournalEntryForm({
   const bareConfirmRef = useRef<HTMLButtonElement>(null)
 
   const isForeign = entryCurrency !== 'SEK'
+  // A bank row's date is the row's: the header shows no date field for it.
+  const showHeaderDate = !(embedded && initialDate)
 
   const isUploading = uploadedFiles.some((f) => f.status === 'uploading')
 
@@ -335,6 +360,9 @@ export default function JournalEntryForm({
   useEffect(() => {
     onHasContentChange?.(hasContent)
   }, [hasContent, onHasContentChange])
+  useEffect(() => {
+    onUploadedFilesChange?.(uploadedFiles)
+  }, [uploadedFiles, onUploadedFilesChange])
 
   // Resolve + set the default voucher series for a source type from the cached
   // company config: prefer the per-source-type mapping, fall back to the legacy
@@ -803,13 +831,20 @@ export default function JournalEntryForm({
   // The guard lives inside the functional updater so chained updates see each
   // other's result, making it idempotent and safe under StrictMode's dev-only
   // double-invoke (no runaway append, no double blank row).
+  //
+  // A blank last row needs nothing, so no update is made then. This effect
+  // runs after every keystroke in a row, and right after a render React does
+  // not drop an update that changes nothing: it leaves one more render
+  // pending behind the keystroke. React counts each commit that leaves one
+  // pending as nested: keystrokes handled before that render ran (fast typing
+  // of a long radtext) added up, and past 50 the next keystroke threw
+  // "Maximum update depth exceeded" (React #185) in its own setLines.
   useEffect(() => {
+    const last = lines[lines.length - 1]
+    if (!last || isBlankVoucherRow(last)) return
     setLines((prev) => {
-      const last = prev[prev.length - 1]
-      if (!last) return prev
-      const trailingBlank =
-        last.account_number === '' && last.debit_amount === '' && last.credit_amount === ''
-      return trailingBlank ? prev : [...prev, makeBlankLine()]
+      const latest = prev[prev.length - 1]
+      return !latest || isBlankVoucherRow(latest) ? prev : [...prev, makeBlankLine()]
     })
   }, [lines, makeBlankLine])
 
@@ -1561,9 +1596,12 @@ export default function JournalEntryForm({
       {/* Verifikat metadata: compact bar on top (Fortnox-style). Date, series
           and period are pre-filled; the period derives from the date. The
           konteringsrader below are the focus. */}
-      <div className="rounded-lg p-3 space-y-3 bg-control shadow-raised">
-        <div className="grid gap-3 grid-cols-1 sm:grid-cols-[1fr_2fr_auto]">
-          {!(embedded && initialDate) && (
+      <div className={onPage ? 'space-y-3 border-b-hairline pb-4' : 'rounded-lg p-3 space-y-3 bg-control shadow-raised'}>
+        {/* The description takes the width; the date and the series are as
+            wide as what they hold. A bank row's date is the row's and is not
+            shown, and the series then sits beside the description. */}
+        <div className={cn('grid gap-3 grid-cols-1', headerColumns(showHeaderDate, showSeries))}>
+          {showHeaderDate && (
             <div>
               <Label className="text-xs text-muted-foreground">{t('date')}</Label>
               <Input
@@ -1588,7 +1626,7 @@ export default function JournalEntryForm({
             // Closed list, not free text: the letters carry fixed meanings
             // (A = redovisning, B = kundfakturor, ...) and a typo here silently
             // starts a new series with its own number sequence.
-            <div className="w-full sm:w-72">
+            <div className="w-full">
               <Label className="text-xs text-muted-foreground">{t('series')}</Label>
               <Select
                 value={voucherSeries}
@@ -1961,6 +1999,7 @@ export default function JournalEntryForm({
           <DocumentUploadZone
             files={uploadedFiles}
             onFilesChange={setUploadedFiles}
+            dropSurfaceRef={uploadDropSurfaceRef}
           />
         </div>
       )}
